@@ -1,0 +1,163 @@
+WITH 
+ Active_drivers AS 
+ (SELECT 
+    City,
+    CASE
+     WHEN Service_type IS NULL THEN NULL
+     WHEN Service_Type = 'Motor' THEN 'Two-wheeler'
+     WHEN Service_Type = 'LalaNOW' THEN 'Two-wheeler'
+     WHEN Service_Type = 'Lala2H' THEN 'Two-wheeler'
+     ELSE 'Big Vehicle' END AS Wheel,
+    DATE_TRUNC(DATE(Placed_Time),MONTH) AS Month,
+    COUNT(DISTINCT Driver_ID) AS Active
+    FROM `lunar-brace-281108.LLM.13M_Order`
+  GROUP BY City, Wheel, Month),
+ Driver_data AS
+  (SELECT
+    DISTINCT Driver_ID,
+    City, 
+    CASE
+    WHEN Vehicle_Type IS NULL THEN NULL
+    WHEN Vehicle_Type = 'Motorcycle' THEN 'Two-wheeler'
+    ELSE 'Big Vehicle' END AS Wheel,
+    DATE_TRUNC(DATE(PARSE_DATETIME('%m/%d/%Y %I:%M:%S %p', First_Time_Taken_Orders__Completed_ )),MONTH) AS FTD_Month, 
+    DATE_TRUNC(DATE(PARSE_DATETIME('%m/%d/%Y %I:%M:%S %p', Verified__Last__Date_Time )),MONTH) AS FTV_Month   
+  FROM `lunar-brace-281108.LLM.DriversData`),
+ FTD AS
+  (SELECT 
+    City,
+    Wheel,
+    FTD_Month Month,
+    COUNT (DISTINCT Driver_ID) AS FTD
+    FROM Driver_data
+   GROUP BY City, Wheel, FTD_Month),
+ Verified AS
+  (SELECT
+    City,
+    Wheel,
+    FTV_Month Month, 
+    COUNT(DISTINCT Driver_ID) AS Verified
+   FROM Driver_data
+   GROUP BY City, Wheel, FTV_Month),
+  
+  /* CHURN */
+Curent AS
+  (SELECT DISTINCT *
+   FROM (
+          SELECT
+          City,
+          CASE
+              WHEN Vehicle_Type IS NULL THEN NULL
+              WHEN Vehicle_Type = 'MOTORCYCLE' THEN 'Two-wheeler'
+              ELSE 'Big Vehicle' END AS Wheel,
+          Driver_ID,
+          DATE_TRUNC(DATE(Order_Date_Time ),MONTH) AS Order_month
+          FROM `lunar-brace-281108.LLM.13M_Order`)),
+ 
+ Churn AS 
+    (SELECT Curent.City,
+           Curent.Wheel,
+           Curent.Driver_ID,
+           Curent.Order_month Prev_month ,
+           a.Order_month Current_month
+    FROM Curent
+    LEFT OUTER JOIN Curent a
+    ON a.Driver_ID = Curent.Driver_ID
+    AND a.City = Curent.City
+    AND a.Wheel = Curent.Wheel
+    AND a.Order_month = DATE_ADD(Curent.Order_month, INTERVAL 1 MONTH)),
+    
+ Rejected AS
+  (SELECT City,
+            CASE
+              WHEN Vehicle_Type = 'Motorcycle' THEN 'Two-wheeler'
+              ELSE 'Big Vehicle' END AS Wheel,
+            DATE_TRUNC(DATE(PARSE_DATETIME('%m/%d/%Y %I:%M:%S %p', Last_Time_Taken_Orders)),MONTH) as Last_taken_month,
+            COUNT(DISTINCT Driver_ID) Rejected_drivers,
+     FROM `lunar-brace-281108.LLM.DriversData`
+     WHERE Verify_Status = 'Rejected'
+     GROUP BY City, Wheel,Last_taken_month),
+    
+ Churn_drivers AS
+   (SELECT Churn.City, 
+            Churn.Wheel, 
+            DATE_ADD(Churn.Prev_month, INTERVAL 1 MONTH) Churn_month,
+            COUNT (DISTINCT Churn.Driver_ID) Churn_drivers
+    FROM Churn
+    WHERE Current_month IS NULL
+    GROUP BY City, Wheel, Churn_month),
+ Active_past_month AS
+  (SELECT City, 
+            Wheel, 
+            DATE_ADD(Month, INTERVAL 1 MONTH) Past_month,
+            Month,
+            Active Past_drivers
+    FROM Active_drivers),
+ Churn_count AS
+    (SELECT c.City,
+           c.Wheel,
+           c.Churn_month Month,
+           c.Churn_drivers Churn_,
+           CASE
+              WHEN r.Rejected_drivers IS NULL then 0 
+              ELSE r.Rejected_drivers END AS Rejected_drivers
+    FROM Churn_drivers c
+    LEFT OUTER JOIN 
+        (SELECT * FROM  Rejected) r
+        ON r.City = c.City
+        AND r.Wheel = c.Wheel
+        AND r.Last_taken_month = c.Churn_month),
+        
+ Churning AS
+   (SELECT City, Wheel, Month, Churn_ - Rejected_drivers Churn
+   FROM Churn_count),
+        
+/* RETAIN */
+ Retaining_drivers AS
+   (SELECT Churn.City, 
+            Churn.Wheel, 
+            Current_month Month,
+            COUNT (DISTINCT Churn.Driver_ID) Retaining
+    FROM Churn
+    WHERE Current_month IS NOT NULL
+    GROUP BY City, Wheel, Current_month),
+
+/* REACTIVATE */
+ Total AS
+  (SELECT Active_drivers.City,
+          Active_drivers.Wheel,
+          Active_drivers.Month,
+          Active_drivers.Active,
+          FTD.FTD,
+          Verified.Verified,
+          FTD.FTD/Verified.Verified FDT_rate,
+          Churning.Churn,
+          Churning.Churn/Active_past_month.Past_drivers Churn_rate,
+          Active_drivers.Active - FTD.FTD - Retaining_drivers.Retaining Reactivated,
+          ((Active_drivers.Active - FTD.FTD - Retaining_drivers.Retaining) / Active_drivers.Active) Reactivated_rate
+   FROM Active_drivers
+   LEFT  JOIN FTD
+   ON FTD.City = Active_drivers.City
+   AND FTD.Wheel = Active_drivers.Wheel
+   AND FTD.Month = Active_drivers.Month
+   LEFT  JOIN Retaining_drivers
+   ON Retaining_drivers.City = Active_drivers.City
+   AND Retaining_drivers.Wheel = Active_drivers.Wheel
+   AND Retaining_drivers.Month = Active_drivers.Month
+   LEFT  JOIN Churning
+   ON Churning.City = Active_drivers.City
+   AND Churning.Wheel = Active_drivers.Wheel
+   AND Churning.Month = Active_drivers.Month
+   LEFT  JOIN Verified
+   ON Verified.City = Active_drivers.City
+   AND Verified.Wheel = Active_drivers.Wheel
+   AND Verified.Month = Active_drivers.Month
+   LEFT  JOIN Active_past_month
+   ON Active_past_month.City = Active_drivers.City
+   AND Active_past_month.Wheel = Active_drivers.Wheel
+   AND Active_past_month.Past_month = Active_drivers.Month
+  )
+ SELECT * FROM Total
+ ORDER BY City, Wheel, Month  
+
+    
